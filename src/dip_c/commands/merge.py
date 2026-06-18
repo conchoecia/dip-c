@@ -1,13 +1,20 @@
 """Hierarchical sort-merge of .pairs.gz files.
 
-Merges all .pairs.gz files in a directory into a single sorted,
-compressed .pairs.gz file using GNU sort (merge mode) and pigz.
+Merges multiple .pairs.gz files into a single sorted, compressed
+.pairs.gz file using GNU sort (merge mode) and pigz.
+
+Inputs may be supplied as:
+  * Positional arguments: individual .pairs.gz files and/or
+    directories (each directory is expanded to its *.pairs.gz files).
+  * A manifest file via -T/--files-from (one path per line; use '-'
+    to read from stdin).
+The two sources may be combined; duplicates are removed.
 
 Requires:  sort, gunzip, pigz  (standard on HPC systems)
 
 Usage:
-    dip-c merge <dir> -g <genome> [-o <output>] [-H <header>]
-                [-j <jobs>] [-m <memory>]
+    dip-c merge [INPUT ...] [-T FILE] -o <output> [-g <genome>]
+                [-h <header>] [-j <jobs>] [-m <memory>]
 """
 
 import argparse
@@ -19,7 +26,6 @@ import sys
 import tempfile
 import time
 from concurrent.futures import ProcessPoolExecutor, as_completed
-from pathlib import Path
 
 from dip_c.merge_utils import (
     SORT_KEYS,
@@ -75,12 +81,19 @@ def _phase1_decompress(pairs_files, work_dir, max_jobs):
     """Decompress .pairs.gz files, stripping headers."""
     _log("Phase 1: Decompressing %d .pairs.gz files..." % len(pairs_files))
 
+    # Index-prefix the output filename so that two inputs with the same
+    # basename (from different directories) cannot collide in work_dir.
+    # The original basename is kept for debuggability.
+    width = max(4, len(str(len(pairs_files) - 1)))
     noheader_files = []
     with ProcessPoolExecutor(max_workers=max_jobs) as pool:
         futures = {}
-        for pf in pairs_files:
-            base = os.path.basename(pf).replace(".pairs.gz", ".noheader.pairs")
-            out = os.path.join(work_dir, base)
+        for idx, pf in enumerate(pairs_files):
+            stem = os.path.basename(pf)
+            if stem.endswith(".pairs.gz"):
+                stem = stem[: -len(".pairs.gz")]
+            out_name = "%0*d_%s.noheader.pairs" % (width, idx, stem)
+            out = os.path.join(work_dir, out_name)
             noheader_files.append(out)
             futures[pool.submit(decompress_strip_header, pf, out)] = pf
 
@@ -240,26 +253,67 @@ def _phase6_hierarchical_merge(sorted_batches, median, sort_mem_gb,
 
 
 def _phase7_compress(final_sorted, header_text, output_path, pigz_threads):
-    """Prepend header and compress with pigz."""
+    """Prepend header and compress with pigz, atomically.
+
+    Writes to ``<output_path>.tmp.<pid>`` and ``os.replace``s it onto
+    the final path only on success. On any failure (pigz error,
+    SIGINT/Ctrl-C, broken pipe), the partial temp file is removed and
+    the running pigz process is killed, so callers never observe a
+    half-written ``output_path``.
+    """
     _log("Phase 7: Compressing with pigz (%d threads)..." % pigz_threads)
-
-    with open(output_path, "wb") as out:
-        pigz = subprocess.Popen(
-            ["pigz", "-p", str(pigz_threads)],
-            stdin=subprocess.PIPE, stdout=out, stderr=subprocess.DEVNULL,
-        )
-        # Write header
-        pigz.stdin.write(header_text.encode("utf-8"))
-        # Stream sorted data
-        with open(final_sorted, "rb") as f:
-            shutil.copyfileobj(f, pigz.stdin, length=1024 * 1024)
-        pigz.stdin.close()
-        pigz.wait()
-
-    if pigz.returncode != 0:
-        sys.stderr.write("[E::merge] pigz failed with exit code %d\n"
-                         % pigz.returncode)
-        raise SystemExit(1)
+    tmp_out = "%s.tmp.%d" % (output_path, os.getpid())
+    pigz = None
+    pigz_err = b""
+    try:
+        with open(tmp_out, "wb") as out:
+            pigz = subprocess.Popen(
+                ["pigz", "-p", str(pigz_threads)],
+                stdin=subprocess.PIPE, stdout=out, stderr=subprocess.PIPE,
+            )
+            try:
+                pigz.stdin.write(header_text.encode("utf-8"))
+                with open(final_sorted, "rb") as f:
+                    shutil.copyfileobj(f, pigz.stdin, length=1024 * 1024)
+            except BrokenPipeError:
+                # pigz died early; the real error is on its stderr,
+                # which we drain below before raising.
+                pass
+            finally:
+                try:
+                    pigz.stdin.close()
+                except (OSError, BrokenPipeError):
+                    pass
+            # pigz stderr is small (a single error line, if any), so a
+            # blocking read here is safe and avoids communicate()'s
+            # double-flush of an already-closed stdin.
+            pigz_err = pigz.stderr.read()
+            pigz.stderr.close()
+            pigz.wait()
+        if pigz.returncode != 0:
+            raise RuntimeError(
+                "pigz failed (exit %d): %s"
+                % (pigz.returncode,
+                   (pigz_err or b"").decode("utf-8", "replace").strip())
+            )
+        os.replace(tmp_out, output_path)
+    except BaseException:
+        # Kill pigz if still running, then remove the partial output.
+        if pigz is not None and pigz.poll() is None:
+            try:
+                pigz.kill()
+            except OSError:
+                pass
+            try:
+                pigz.wait(timeout=5)
+            except (OSError, subprocess.TimeoutExpired):
+                pass
+        if os.path.exists(tmp_out):
+            try:
+                os.remove(tmp_out)
+            except OSError:
+                pass
+        raise
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -279,12 +333,21 @@ def _build_parser():
         add_help=False,
         epilog="""\
 Usage:
-  dip-c merge -i <dir> -o <output> [-g <genome>]
+  dip-c merge [INPUT ...] [-T FILE] -o <output> [-g <genome>]
               [-h <header.pairs>] [-j <max_jobs>] [-m <max_mem_gb>]
 
+Inputs (one or both required):
+  INPUT ...           Positional: any number of .pairs.gz files and/or
+                      directories. Each directory is expanded to its
+                      *.pairs.gz files.
+  -T, --files-from    Manifest file with one path per line. Use '-' to
+                      read paths from stdin. Lines that are blank or
+                      start with '#' are ignored. Relative paths are
+                      resolved against the manifest's directory (or
+                      the current directory, for stdin).
+
 Required:
-  -i <dir>            Input directory containing .pairs.gz files
-  -o <output>         Output file name (.pairs.gz appended if not present)
+  -o <output>         Output file name (.pairs.gz appended if absent)
 
 Optional:
   -g <genome>         Genome ID: mm10, hg19, hg38
@@ -298,24 +361,40 @@ Sort memory per job = min(total_mem / jobs, 30 GB).
 Batch sizes and grouping factors are computed dynamically from file sizes.
 
 Examples:
-  # Basic merge (auto-detect resources)
-  dip-c merge -i /path/to/pairsgz_dir -g mm10 -o merged
+  # Glob expansion via the shell
+  dip-c merge data/*.pairs.gz -g mm10 -o merged
 
-  # Specify resource limits
-  dip-c merge -i /path/to/pairsgz_dir -g mm10 -o merged.pairs.gz -j 8 -m 64
+  # A whole directory
+  dip-c merge /path/to/pairsgz_dir -g mm10 -o merged.pairs.gz
 
-  # Custom header file
-  dip-c merge -i /path/to/pairsgz_dir -g hg38 -o merged -h header.pairs
+  # Mix files and directories freely
+  dip-c merge a.pairs.gz extra_dir/ b.pairs.gz -g hg38 -o merged
+
+  # Manifest file (one path per line)
+  dip-c merge -T samples.txt -g mm10 -o merged
+
+  # Manifest from stdin (composes with find/xargs)
+  find data -name '*.pairs.gz' | dip-c merge -T - -g mm10 -o merged
+
+  # Manifest plus extra files
+  dip-c merge -T core.txt extra1.pairs.gz extra2.pairs.gz -o merged
 
   # Skip chrom validation (omit -g)
-  dip-c merge -i /path/to/pairsgz_dir -o merged
+  dip-c merge data/*.pairs.gz -o merged
 """,
     )
 
     p.add_argument(
-        "-i", "--input", dest="dir", required=True,
-        metavar="DIR",
-        help="Input directory containing .pairs.gz files to merge.",
+        "inputs", nargs="*", metavar="INPUT",
+        help="One or more .pairs.gz files and/or directories containing "
+             "them. Directories are expanded to their *.pairs.gz files. "
+             "May be combined with -T.",
+    )
+    p.add_argument(
+        "-T", "--files-from", dest="files_from", default=None,
+        metavar="FILE",
+        help="Read input paths from FILE (one per line). Use '-' to read "
+             "from stdin. Blank lines and '#' comments are ignored.",
     )
     p.add_argument(
         "-g", "--genome", required=False, default=None,
@@ -355,6 +434,95 @@ Examples:
 
 
 # ══════════════════════════════════════════════════════════════════════════
+# Input resolution
+# ══════════════════════════════════════════════════════════════════════════
+
+def _resolve_inputs(args, parser):
+    """Collect .pairs.gz paths from positionals and/or a manifest file.
+
+    Resolution rules:
+      * Each positional that is a directory is expanded to its
+        ``*.pairs.gz`` files; each positional that is a file must end
+        with ``.pairs.gz``.
+      * ``-T FILE`` reads one path per line. Blank lines and lines
+        starting with ``#`` are ignored. Relative paths are resolved
+        against the manifest's parent directory (or CWD when reading
+        from stdin via ``-T -``).
+      * Duplicates are removed (first occurrence wins) and the final
+        list is sorted for reproducible batch numbering.
+
+    Exits via ``parser.error`` if no inputs are supplied or if any
+    referenced path is missing or has the wrong extension.
+    """
+    paths = []
+
+    # 1) Positional inputs: files and directories.
+    for entry in args.inputs:
+        p = os.path.abspath(entry)
+        if os.path.isdir(p):
+            found = sorted(glob.glob(os.path.join(p, "*.pairs.gz")))
+            if not found:
+                parser.error("No .pairs.gz files in directory: %s" % p)
+            paths.extend(found)
+        elif os.path.isfile(p):
+            if not p.endswith(".pairs.gz"):
+                parser.error("Not a .pairs.gz file: %s" % entry)
+            paths.append(p)
+        else:
+            parser.error("Not a file or directory: %s" % entry)
+
+    # 2) Manifest file (or stdin) via -T.
+    if args.files_from is not None:
+        if args.files_from == "-":
+            raw_lines = sys.stdin.read().splitlines()
+            base_dir = os.getcwd()
+            src_label = "<stdin>"
+        else:
+            manifest = os.path.abspath(args.files_from)
+            if not os.path.isfile(manifest):
+                parser.error("Manifest file not found: %s" % args.files_from)
+            with open(manifest, "r") as f:
+                raw_lines = f.read().splitlines()
+            base_dir = os.path.dirname(manifest)
+            src_label = manifest
+
+        for lineno, raw in enumerate(raw_lines, start=1):
+            line = raw.strip()
+            if not line or line.startswith("#"):
+                continue
+            p = line if os.path.isabs(line) else os.path.join(base_dir, line)
+            p = os.path.abspath(p)
+            if os.path.isdir(p):
+                parser.error(
+                    "%s:%d: manifest entries must be .pairs.gz files, "
+                    "not directories: %s "
+                    "(pass directories as positional arguments instead)"
+                    % (src_label, lineno, line)
+                )
+            if not os.path.isfile(p):
+                parser.error(
+                    "%s:%d: path does not exist: %s"
+                    % (src_label, lineno, line)
+                )
+            if not p.endswith(".pairs.gz"):
+                parser.error(
+                    "%s:%d: not a .pairs.gz file: %s"
+                    % (src_label, lineno, line)
+                )
+            paths.append(p)
+
+    if not paths:
+        parser.error(
+            "No input files. Provide one or more .pairs.gz files or "
+            "directories as positional arguments, and/or use "
+            "-T <manifest> (use '-' for stdin)."
+        )
+
+    # Deduplicate (preserve first occurrence) and sort for reproducibility.
+    return sorted(dict.fromkeys(paths))
+
+
+# ══════════════════════════════════════════════════════════════════════════
 # CLI entry point  –  called from dip_c.cli as  ``dip-c merge …``
 # ══════════════════════════════════════════════════════════════════════════
 
@@ -363,14 +531,8 @@ def merge(argv):
     parser = _build_parser()
     args = parser.parse_args(argv[1:])
 
-    # -- Validate inputs ---------------------------------------------------
-    pairs_dir = os.path.abspath(args.dir)
-    if not os.path.isdir(pairs_dir):
-        parser.error("Directory does not exist: %s" % pairs_dir)
-
-    pairs_files = sorted(glob.glob(os.path.join(pairs_dir, "*.pairs.gz")))
-    if not pairs_files:
-        parser.error("No .pairs.gz files found in %s" % pairs_dir)
+    # -- Resolve and validate inputs ---------------------------------------
+    pairs_files = _resolve_inputs(args, parser)
 
     genome = args.genome
     if genome is None:
@@ -384,9 +546,31 @@ def merge(argv):
     output = args.output
     if not output.endswith(".pairs.gz"):
         output = output + ".pairs.gz"
+    output = os.path.abspath(output)
+    output_parent = os.path.dirname(output) or os.getcwd()
+    if not os.path.isdir(output_parent):
+        parser.error("Output directory does not exist: %s" % output_parent)
+
     max_jobs = args.jobs or detect_cpus()
     max_mem = args.memory
-    sort_mem_per_job = min(max_mem // max_jobs, 30) if max_jobs > 0 else 30
+
+    if max_mem < 1:
+        parser.error("--memory must be at least 1 GB (got %d)" % max_mem)
+    if max_jobs < 1:
+        parser.error("--jobs must be at least 1 (got %d)" % max_jobs)
+
+    # -m is a hard constraint (HPC schedulers OOM-kill jobs that exceed
+    # it); -j is a soft constraint (just performance). If their ratio
+    # gives <1 GB/job, reduce -j rather than violate -m.
+    sort_mem_per_job = max_mem // max_jobs
+    if sort_mem_per_job < 1:
+        new_jobs = max_mem  # gives exactly 1 GB/job
+        _log("Warning: -m %d GB / -j %d gives <1 GB/job; "
+             "reducing jobs to %d to honour the memory budget."
+             % (max_mem, max_jobs, new_jobs))
+        max_jobs = new_jobs
+        sort_mem_per_job = max_mem // max_jobs
+    sort_mem_per_job = min(sort_mem_per_job, 30)
 
     # -- Check tools -------------------------------------------------------
     check_required_tools()
@@ -394,7 +578,6 @@ def merge(argv):
     # -- Log setup ---------------------------------------------------------
     start_time = time.time()
     _log("Merge started")
-    _log("Directory: %s" % pairs_dir)
     _log("Output: %s" % output)
     _log("Genome: %s" % genome)
     _log("Found %d .pairs.gz files" % len(pairs_files))
@@ -402,11 +585,26 @@ def merge(argv):
          % (max_jobs, max_mem, sort_mem_per_job))
 
     # -- Single-file shortcut ----------------------------------------------
-    if len(pairs_files) == 1:
-        _log("Only 1 file found, copying to output")
-        shutil.copy2(pairs_files[0], output)
+    # Only valid when the result would be byte-identical to a copy:
+    # no custom header, and no chrom-order validation (which may
+    # remove rows).
+    if len(pairs_files) == 1 and not args.header and genome == "any":
+        _log("Only 1 file and no -h/-g requested, copying to output")
+        tmp_out = "%s.tmp.%d" % (output, os.getpid())
+        try:
+            shutil.copy2(pairs_files[0], tmp_out)
+            os.replace(tmp_out, output)
+        except BaseException:
+            if os.path.exists(tmp_out):
+                try:
+                    os.remove(tmp_out)
+                except OSError:
+                    pass
+            raise
         _log("Done in %s" % _elapsed(start_time))
         return 0
+    if len(pairs_files) == 1:
+        _log("Only 1 file found; running pipeline to honour -h/-g")
 
     # -- Header extraction -------------------------------------------------
     if args.header:
@@ -420,7 +618,9 @@ def merge(argv):
                 header_text.count("\n")))
 
     # -- Create work directory ---------------------------------------------
-    work_dir = tempfile.mkdtemp(prefix=".merge_work_", dir=pairs_dir)
+    # Placed next to the output so spill/staging stays on the same
+    # filesystem as the final file.
+    work_dir = tempfile.mkdtemp(prefix=".merge_work_", dir=output_parent)
     _log("Work directory: %s" % work_dir)
 
     try:

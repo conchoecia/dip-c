@@ -2,6 +2,8 @@
 
 Provides matrix visualization, chromosome ordering, and genome-aware
 layout helpers used by the hicplot* commands.
+
+Requires optional dependencies: pip install run-dipc[hicplot]
 """
 
 import os
@@ -10,10 +12,30 @@ import re
 from contextlib import contextmanager
 
 import numpy as np
-import hictkpy
-import matplotlib
-import matplotlib.pyplot as plt
-from matplotlib.colors import LinearSegmentedColormap, to_rgba
+
+# Lazy imports for optional deps -- checked at call sites
+_HICSTRAW = None
+_PLT = None
+_LSCM = None
+
+
+def _ensure_hicplot_deps():
+    """Import hic-straw, matplotlib; raise informative error if missing."""
+    global _HICSTRAW, _PLT, _LSCM
+    if _HICSTRAW is None:
+        try:
+            import hicstraw
+            import matplotlib.pyplot as plt
+            from matplotlib.colors import LinearSegmentedColormap
+        except ImportError as exc:
+            sys.stderr.write(
+                "[E::hicplot] Missing dependencies. Install with:\n"
+                "    pip install run-dipc[hicplot]\n"
+            )
+            raise SystemExit(1) from exc
+        _HICSTRAW = hicstraw
+        _PLT = plt
+        _LSCM = LinearSegmentedColormap
 
 
 # Colormaps
@@ -30,8 +52,19 @@ DEFAULT_SKIP_CHROMS = {"All", "ALL"}
 # ---------------------------------------------------------------------------
 
 def get_chrom_names(hic_file):
-    """Return the ordered list of chromosome names from a hictkpy File."""
-    return list(hic_file.chromosomes().keys())
+    """Return the ordered list of chromosome names from a HiCFile object."""
+    return [c.name for c in hic_file.getChromosomes()]
+
+
+def strip_chr_prefix(name):
+    """Return *name* without a leading ``chr`` (case-insensitive).
+
+    ``chr1`` -> ``1``, ``chrX`` -> ``X``, ``CHR2`` -> ``2``, ``1`` -> ``1``.
+    Used for human-readable axis labels on contact-map plots.
+    """
+    if name.lower().startswith("chr"):
+        return name[3:]
+    return name
 
 
 
@@ -48,7 +81,8 @@ def ordering_check(chrom_1, chrom_2, chrom_order):
 
 def make_colormap(spec):
     """Create a LinearSegmentedColormap from a ``(name, color_list)`` tuple."""
-    return LinearSegmentedColormap.from_list(spec[0], spec[1])
+    _ensure_hicplot_deps()
+    return _LSCM.from_list(spec[0], spec[1])
 
 
 def resolve_colormap(spec):
@@ -66,6 +100,10 @@ def resolve_colormap(spec):
         resolve_colormap("blue,white,red")
         resolve_colormap("#0000ff,#ffffff,#ff0000")
     """
+    _ensure_hicplot_deps()
+    import matplotlib
+    from matplotlib.colors import to_rgba
+
     try:
         return matplotlib.colormaps[spec]
     except (KeyError, ValueError):
@@ -87,7 +125,7 @@ def resolve_colormap(spec):
         )
         raise SystemExit(1) from exc
 
-    return LinearSegmentedColormap.from_list("custom", colors)
+    return _LSCM.from_list("custom", colors)
 
 
 # ---------------------------------------------------------------------------
@@ -95,12 +133,23 @@ def resolve_colormap(spec):
 # ---------------------------------------------------------------------------
 
 def plot_matrix(input_matrix, output_png_path, cmap, vmin, vmax,
-                multipl_factor=10, hlines=None, vlines=None):
+                multipl_factor=10, hlines=None, vlines=None,
+                row_labels=None, col_labels=None, label_fontsize=None):
     """Render *input_matrix* as a publication-quality PNG.
 
     Automatically switches to 1 px/bin for matrices >= 1000 bins on a side
     to avoid memory exhaustion.
+
+    *row_labels* / *col_labels* are optional sequences of
+    ``(center, text)`` pairs, where ``center`` is in matrix-data
+    coordinates. Row labels render outside the left edge, column labels
+    outside the top edge, sized to the figure.
+
+    *label_fontsize* (in points) overrides the figure-size-scaled
+    default. Ignored when no labels are supplied.
     """
+    _ensure_hicplot_deps()
+
     dpi = 300
     if input_matrix.shape[0] >= 1000:
         multipl_factor = 1
@@ -111,7 +160,7 @@ def plot_matrix(input_matrix, output_png_path, cmap, vmin, vmax,
     )
     sys.stderr.write("[M::hicplot] Figure size: %s\n" % (figsize,))
 
-    fig = plt.figure(figsize=figsize, dpi=dpi)
+    fig = _PLT.figure(figsize=figsize, dpi=dpi)
     ax = fig.add_axes([0, 0, 1, 1])
     ax.imshow(input_matrix, cmap=cmap, vmin=vmin, vmax=vmax,
               aspect="equal", interpolation="nearest")
@@ -123,10 +172,37 @@ def plot_matrix(input_matrix, output_png_path, cmap, vmin, vmax,
         for x in vlines:
             ax.axvline(x=x, color="black", linewidth=0.5)
 
-    plt.axis("off")
-    plt.savefig(output_png_path, format="png", dpi=dpi,
-                bbox_inches="tight", pad_inches=0, transparent=True)
-    plt.close()
+    has_labels = bool(row_labels) or bool(col_labels)
+    if has_labels:
+        # If the caller didn't pin a font size, scale with figure size
+        # (clamped to a sensible range). bbox_inches='tight' will expand
+        # the saved canvas to include annotations placed outside the
+        # axes box.
+        if label_fontsize is None:
+            label_fontsize = max(6.0, min(20.0, max(figsize) * 1.0))
+        if row_labels:
+            for center, text in row_labels:
+                ax.annotate(
+                    text,
+                    xy=(0, center), xycoords=("axes fraction", "data"),
+                    xytext=(-6, 0), textcoords="offset points",
+                    ha="right", va="center", fontsize=label_fontsize,
+                )
+        if col_labels:
+            for center, text in col_labels:
+                ax.annotate(
+                    text,
+                    xy=(center, 1), xycoords=("data", "axes fraction"),
+                    xytext=(0, 6), textcoords="offset points",
+                    ha="center", va="bottom", fontsize=label_fontsize,
+                )
+
+    _PLT.axis("off")
+    _PLT.savefig(output_png_path, format="png", dpi=dpi,
+                 bbox_inches="tight",
+                 pad_inches=0.05 if has_labels else 0,
+                 transparent=True)
+    _PLT.close()
 
 
 # ---------------------------------------------------------------------------
@@ -173,6 +249,34 @@ def chroms_per_row_for_genome(num_chroms):
     return num_chroms
 
 
+def grid_centers(matrices, matrices_per_row):
+    """Return ``(row_centers, col_centers)`` for an N-per-row tile grid.
+
+    Each centre is the midpoint of that row's (or column's) span on the
+    composited canvas, suitable as a label coordinate. The sizing rule
+    matches :func:`get_positions_and_matrix_size`: row height = max
+    height of the tiles in that row, column width = max width of the
+    tiles in that column.
+    """
+    row_sizes = [
+        max(m.shape[0] for m in matrices[i:i + matrices_per_row])
+        for i in range(0, len(matrices), matrices_per_row)
+    ]
+    col_sizes = [
+        max(m.shape[1] for m in matrices[i::matrices_per_row])
+        for i in range(matrices_per_row)
+    ]
+    row_centers, cum = [], 0
+    for s in row_sizes:
+        row_centers.append(cum + s / 2)
+        cum += s
+    col_centers, cum = [], 0
+    for s in col_sizes:
+        col_centers.append(cum + s / 2)
+        cum += s
+    return row_centers, col_centers
+
+
 def filter_chroms(chrom_list):
     """Remove Juicer's ``All`` pseudo-chromosome from *chrom_list*."""
     return [c for c in chrom_list if c[0] not in DEFAULT_SKIP_CHROMS]
@@ -182,7 +286,7 @@ def filter_chroms(chrom_list):
 def _suppress_native_stderr():
     """Temporarily redirect file-descriptor 2 to /dev/null.
 
-    Suppresses warnings printed by C/C++ libraries (e.g. hictkpy)
+    Suppresses warnings printed by C/C++ libraries (e.g. hic-straw)
     that write directly to fd 2 and cannot be caught from Python.
     Python-level sys.stderr is also silenced while inside the context,
     so keep usage narrow.
@@ -205,19 +309,21 @@ def validate_chroms(hic, chroms, normalization, resolution):
 
     Probes each chromosome with a full self-vs-self query at the given
     resolution.  Chromosomes whose matrix is empty or all-zero are
-    dropped.  C-level warnings are suppressed during the probe so they
-    do not clutter stderr.
+    dropped.  C-level hic-straw warnings are suppressed during the
+    probe so they do not clutter stderr.
 
     Returns ``(valid_chroms, skipped_names)``.
     """
-    norm_arg = normalization if normalization != "NONE" else None
+    _ensure_hicplot_deps()
     valid = []
     skipped = []
     with _suppress_native_stderr():
         for name, length in chroms:
             try:
-                sel = hic.fetch(name, normalization=norm_arg)
-                m = sel.to_numpy()
+                mo = hic.getMatrixZoomData(
+                    name, name, "observed", normalization, "BP", resolution,
+                )
+                m = mo.getRecordsAsMatrix(1, int(length), 1, int(length))
                 if m.size > 0 and m.sum() != 0:
                     valid.append((name, length))
                 else:

@@ -7,23 +7,32 @@ present:
   -c1 supplied?   => single-region   (one chromosomal window)
   --allinone?     => whole genome composited into one PNG
   (none of above) => per-chromosome  (one PNG per chromosome)
+
+Add ``-L`` to draw chromosome names alongside the contact map(s) in any
+mode (with ``--label-fontsize`` to override the auto-sized font).
+
+Requires:  pip install run-dipc[hicplot]
 """
 
 import argparse
 import sys
 import numpy as np
-import hictkpy
+
+import dip_c.hicplot_utils as _hu
 
 from dip_c.hicplot_utils import (
+    _ensure_hicplot_deps,
     get_chrom_names,
     ordering_check,
     make_colormap,
     resolve_colormap,
     plot_matrix,
     get_positions_and_matrix_size,
+    grid_centers,
     chroms_per_row_for_genome,
     filter_chroms,
     validate_chroms,
+    strip_chr_prefix,
     strip_png_ext,
     REDMAP_SPEC,
     BWRMAP_SPEC,
@@ -86,89 +95,112 @@ def _parse_region(spec):
 # ==========================================================================
 
 def _plot_map(hic_path, norm, output, chroms, region, resolution, maxcolor,
-              normalization, cmap=None):
+              normalization, cmap=None, labels=False, label_fontsize=None):
     """Single chromosomal region from one .hic file."""
+    _ensure_hicplot_deps()
     if cmap is None:
         cmap = make_colormap(REDMAP_SPEC)
 
-    hic = hictkpy.File(hic_path, resolution)
+    hic = _hu._HICSTRAW.HiCFile(hic_path)
     chrom_order = get_chrom_names(hic)
     sys.stderr.write("[M::hicplot] .hic file loaded\n")
     sys.stderr.write("[M::hicplot] Normalization: %s\n" % normalization)
 
-    norm_arg = normalization if normalization != "NONE" else None
-    range1 = "%s:%d-%d" % (chroms[0], region[0], region[1])
-    range2 = "%s:%d-%d" % (chroms[1], region[2], region[3])
+    mo = hic.getMatrixZoomData(
+        chroms[0], chroms[1], "observed", normalization, "BP", resolution,
+    )
     sys.stderr.write("[M::hicplot] Matrix zoom data retrieved\n")
 
     if ordering_check(chroms[0], chroms[1], chrom_order):
-        mat = hic.fetch(range1, range2, normalization=norm_arg).to_numpy()
+        mat = mo.getRecordsAsMatrix(region[0], region[1], region[2], region[3])
     else:
-        mat = hic.fetch(range2, range1, normalization=norm_arg).to_numpy()
+        mat = mo.getRecordsAsMatrix(region[2], region[3], region[0], region[1])
         mat = mat.transpose()
 
     if normalization == "NONE":
         mat = mat / norm
 
     sys.stderr.write("[M::hicplot] Matrix shape: %s\n" % (mat.shape,))
-    plot_matrix(mat, output, cmap, 0, maxcolor)
+    row_labels = col_labels = None
+    if labels:
+        rows, cols = mat.shape
+        # chroms[0] is the row-axis (y), chroms[1] is the column-axis (x).
+        row_labels = [(rows / 2, strip_chr_prefix(chroms[0]))]
+        col_labels = [(cols / 2, strip_chr_prefix(chroms[1]))]
+    plot_matrix(mat, output, cmap, 0, maxcolor,
+                row_labels=row_labels, col_labels=col_labels,
+                label_fontsize=label_fontsize)
 
 
 def _plot_all(hic_path, norm, output, resolution, maxcolor, normalization,
-              cmap=None):
+              cmap=None, labels=False, label_fontsize=None):
     """Each chromosome individually -- one PNG per chromosome."""
+    _ensure_hicplot_deps()
     if cmap is None:
         cmap = make_colormap(REDMAP_SPEC)
 
-    hic = hictkpy.File(hic_path, resolution)
+    hic = _hu._HICSTRAW.HiCFile(hic_path)
     sys.stderr.write("[M::hicplot] .hic file loaded (genome: %s)\n"
-                     % hic.attributes().get("assembly", "unknown"))
+                     % hic.getGenomeID())
     sys.stderr.write("[M::hicplot] Normalization: %s\n" % normalization)
 
-    chroms = filter_chroms(list(hic.chromosomes().items()))
+    chroms = filter_chroms([(c.name, c.length) for c in hic.getChromosomes()])
     chroms, skipped = validate_chroms(hic, chroms, normalization, resolution)
     if skipped:
         sys.stderr.write("[W::hicplot] Skipped chromosomes without data: %s\n"
                          % ", ".join(skipped))
     base = strip_png_ext(output)
 
-    norm_arg = normalization if normalization != "NONE" else None
     for name, length in chroms:
-        mat = hic.fetch(name, normalization=norm_arg).to_numpy()
+        mo = hic.getMatrixZoomData(
+            name, name, "observed", normalization, "BP", resolution,
+        )
+        mat = mo.getRecordsAsMatrix(1, int(length), 1, int(length))
         if normalization == "NONE":
             mat = mat / norm
 
-        plot_matrix(mat, "%s_%s.png" % (base, name), cmap, 0, maxcolor)
+        row_labels = col_labels = None
+        if labels:
+            rows, cols = mat.shape
+            text = strip_chr_prefix(name)
+            row_labels = [(rows / 2, text)]
+            col_labels = [(cols / 2, text)]
+        plot_matrix(mat, "%s_%s.png" % (base, name), cmap, 0, maxcolor,
+                    row_labels=row_labels, col_labels=col_labels,
+                    label_fontsize=label_fontsize)
         sys.stderr.write("[M::hicplot] Chromosome %s complete\n" % name)
 
 
 def _plot_allinone(hic_path, norm, output, resolution, maxcolor,
-                   normalization, gridlines=True, cmap=None):
+                   normalization, gridlines=True, cmap=None, labels=False,
+                   label_fontsize=None):
     """Whole genome composited into one image."""
+    _ensure_hicplot_deps()
     if cmap is None:
         cmap = make_colormap(REDMAP_SPEC)
 
-    hic = hictkpy.File(hic_path, resolution)
+    hic = _hu._HICSTRAW.HiCFile(hic_path)
     chrom_order = get_chrom_names(hic)
     sys.stderr.write("[M::hicplot] .hic file loaded (genome: %s)\n"
-                     % hic.attributes().get("assembly", "unknown"))
+                     % hic.getGenomeID())
     sys.stderr.write("[M::hicplot] Normalization: %s\n" % normalization)
 
-    chroms = filter_chroms(list(hic.chromosomes().items()))
+    chroms = filter_chroms([(c.name, c.length) for c in hic.getChromosomes()])
     chroms, skipped = validate_chroms(hic, chroms, normalization, resolution)
     if skipped:
         sys.stderr.write("[W::hicplot] Skipped chromosomes without data: %s\n"
                          % ", ".join(skipped))
-    chrom_names = [c[0] for c in chroms]
     matrices = []
 
-    norm_arg = normalization if normalization != "NONE" else None
     for row in chroms:
         for col in chroms:
+            mo = hic.getMatrixZoomData(
+                row[0], col[0], "observed", normalization, "BP", resolution,
+            )
             if ordering_check(row[0], col[0], chrom_order):
-                m = hic.fetch(row[0], col[0], normalization=norm_arg).to_numpy()
+                m = mo.getRecordsAsMatrix(1, int(row[1]), 1, int(col[1]))
             else:
-                m = hic.fetch(col[0], row[0], normalization=norm_arg).to_numpy()
+                m = mo.getRecordsAsMatrix(1, int(col[1]), 1, int(row[1]))
                 m = m.transpose()
             matrices.append(m)
 
@@ -190,7 +222,17 @@ def _plot_allinone(hic_path, norm, output, resolution, maxcolor,
         hlines = sorted(set(r for _, (r, _) in zip(matrices, positions)) - {0})
         vlines = sorted(set(c for _, (_, c) in zip(matrices, positions)) - {0})
 
-    plot_matrix(final, output, cmap, 0, maxcolor, hlines=hlines, vlines=vlines)
+    row_labels = col_labels = None
+    if labels:
+        row_centers, col_centers = grid_centers(matrices, per_row)
+        names = [strip_chr_prefix(c[0]) for c in chroms]
+        row_labels = list(zip(row_centers, names))
+        col_labels = list(zip(col_centers, names))
+
+    plot_matrix(final, output, cmap, 0, maxcolor,
+                hlines=hlines, vlines=vlines,
+                row_labels=row_labels, col_labels=col_labels,
+                label_fontsize=label_fontsize)
 
 
 # ==========================================================================
@@ -205,98 +247,135 @@ def _diff(m1, norm1, m2, norm2, normalization):
 
 
 def _plot_diff_map(path1, norm1, path2, norm2, output, chroms, region,
-                   resolution, maxcolor, normalization, cmap=None):
+                   resolution, maxcolor, normalization, cmap=None,
+                   labels=False, label_fontsize=None):
     """Difference map for a single chromosomal region."""
+    _ensure_hicplot_deps()
     if cmap is None:
         cmap = make_colormap(BWRMAP_SPEC)
 
-    hic1 = hictkpy.File(path1, resolution)
-    hic2 = hictkpy.File(path2, resolution)
+    hic1 = _hu._HICSTRAW.HiCFile(path1)
+    hic2 = _hu._HICSTRAW.HiCFile(path2)
     chrom_order = get_chrom_names(hic1)
     sys.stderr.write("[M::hicplot] Both .hic files loaded\n")
     sys.stderr.write("[M::hicplot] Normalization: %s\n" % normalization)
 
-    norm_arg = normalization if normalization != "NONE" else None
-    range1 = "%s:%d-%d" % (chroms[0], region[0], region[1])
-    range2 = "%s:%d-%d" % (chroms[1], region[2], region[3])
+    mo1 = hic1.getMatrixZoomData(
+        chroms[0], chroms[1], "observed", normalization, "BP", resolution,
+    )
+    mo2 = hic2.getMatrixZoomData(
+        chroms[0], chroms[1], "observed", normalization, "BP", resolution,
+    )
 
     if ordering_check(chroms[0], chroms[1], chrom_order):
-        m1 = hic1.fetch(range1, range2, normalization=norm_arg).to_numpy()
-        m2 = hic2.fetch(range1, range2, normalization=norm_arg).to_numpy()
+        m1 = mo1.getRecordsAsMatrix(region[0], region[1], region[2], region[3])
+        m2 = mo2.getRecordsAsMatrix(region[0], region[1], region[2], region[3])
     else:
-        m1 = hic1.fetch(range2, range1, normalization=norm_arg).to_numpy()
-        m2 = hic2.fetch(range2, range1, normalization=norm_arg).to_numpy()
+        m1 = mo1.getRecordsAsMatrix(region[2], region[3], region[0], region[1])
+        m2 = mo2.getRecordsAsMatrix(region[2], region[3], region[0], region[1])
         m1, m2 = m1.transpose(), m2.transpose()
 
     result = _diff(m1, norm1, m2, norm2, normalization)
     sys.stderr.write("[M::hicplot] Diff matrix shape: %s\n" % (result.shape,))
-    plot_matrix(result, output, cmap, -maxcolor, maxcolor)
+    row_labels = col_labels = None
+    if labels:
+        rows, cols = result.shape
+        row_labels = [(rows / 2, strip_chr_prefix(chroms[0]))]
+        col_labels = [(cols / 2, strip_chr_prefix(chroms[1]))]
+    plot_matrix(result, output, cmap, -maxcolor, maxcolor,
+                row_labels=row_labels, col_labels=col_labels,
+                label_fontsize=label_fontsize)
 
 
 def _plot_diff_all(path1, norm1, path2, norm2, output, resolution, maxcolor,
-                   normalization, cmap=None):
+                   normalization, cmap=None, labels=False,
+                   label_fontsize=None):
     """Per-chromosome difference maps."""
+    _ensure_hicplot_deps()
     if cmap is None:
         cmap = make_colormap(BWRMAP_SPEC)
 
-    hic1 = hictkpy.File(path1, resolution)
-    hic2 = hictkpy.File(path2, resolution)
+    hic1 = _hu._HICSTRAW.HiCFile(path1)
+    hic2 = _hu._HICSTRAW.HiCFile(path2)
     sys.stderr.write("[M::hicplot] Both .hic files loaded\n")
     sys.stderr.write("[M::hicplot] Normalization: %s\n" % normalization)
 
-    chroms1 = filter_chroms(list(hic1.chromosomes().items()))
+    chroms1 = filter_chroms([(c.name, c.length) for c in hic1.getChromosomes()])
     chroms1, skipped = validate_chroms(hic1, chroms1, normalization, resolution)
     if skipped:
         sys.stderr.write("[W::hicplot] Skipped chromosomes without data: %s\n"
                          % ", ".join(skipped))
     valid_names = {c[0] for c in chroms1}
-    chroms2 = [(n, l) for n, l in hic2.chromosomes().items()
-               if n in valid_names]
+    chroms2 = [(c.name, c.length) for c in hic2.getChromosomes()
+               if c.name in valid_names]
     base = strip_png_ext(output)
 
-    norm_arg = normalization if normalization != "NONE" else None
     for i in range(len(chroms1)):
-        m1 = hic1.fetch(chroms1[i][0], normalization=norm_arg).to_numpy()
-        m2 = hic2.fetch(chroms2[i][0], normalization=norm_arg).to_numpy()
+        mo1 = hic1.getMatrixZoomData(
+            chroms1[i][0], chroms1[i][0], "observed", normalization,
+            "BP", resolution,
+        )
+        mo2 = hic2.getMatrixZoomData(
+            chroms2[i][0], chroms2[i][0], "observed", normalization,
+            "BP", resolution,
+        )
+        m1 = mo1.getRecordsAsMatrix(1, int(chroms1[i][1]),
+                                     1, int(chroms1[i][1]))
+        m2 = mo2.getRecordsAsMatrix(1, int(chroms2[i][1]),
+                                     1, int(chroms2[i][1]))
 
         result = _diff(m1, norm1, m2, norm2, normalization)
+        row_labels = col_labels = None
+        if labels:
+            rows, cols = result.shape
+            text = strip_chr_prefix(chroms1[i][0])
+            row_labels = [(rows / 2, text)]
+            col_labels = [(cols / 2, text)]
         plot_matrix(result, "%s_%s.png" % (base, chroms1[i][0]),
-                    cmap, -maxcolor, maxcolor)
+                    cmap, -maxcolor, maxcolor,
+                    row_labels=row_labels, col_labels=col_labels,
+                    label_fontsize=label_fontsize)
         sys.stderr.write("[M::hicplot] Chromosome %s complete\n"
                          % chroms1[i][0])
 
 
 def _plot_diff_allinone(path1, norm1, path2, norm2, output, resolution,
-                        maxcolor, normalization, gridlines=True, cmap=None):
+                        maxcolor, normalization, gridlines=True, cmap=None,
+                        labels=False, label_fontsize=None):
     """Whole-genome difference map in one image."""
+    _ensure_hicplot_deps()
     if cmap is None:
         cmap = make_colormap(BWRMAP_SPEC)
 
-    hic1 = hictkpy.File(path1, resolution)
-    hic2 = hictkpy.File(path2, resolution)
+    hic1 = _hu._HICSTRAW.HiCFile(path1)
+    hic2 = _hu._HICSTRAW.HiCFile(path2)
     chrom_order = get_chrom_names(hic1)
     sys.stderr.write("[M::hicplot] Both .hic files loaded (genome: %s)\n"
-                     % hic1.attributes().get("assembly", "unknown"))
+                     % hic1.getGenomeID())
     sys.stderr.write("[M::hicplot] Normalization: %s\n" % normalization)
 
-    chroms1 = filter_chroms(list(hic1.chromosomes().items()))
+    chroms1 = filter_chroms([(c.name, c.length) for c in hic1.getChromosomes()])
     chroms1, skipped = validate_chroms(hic1, chroms1, normalization, resolution)
     if skipped:
         sys.stderr.write("[W::hicplot] Skipped chromosomes without data: %s\n"
                          % ", ".join(skipped))
-    chrom_names = [c[0] for c in chroms1]
     matrices = []
 
-    norm_arg = normalization if normalization != "NONE" else None
     for i in range(len(chroms1)):
         for j in range(len(chroms1)):
             cr, cc = chroms1[i], chroms1[j]
+            mo1 = hic1.getMatrixZoomData(
+                cr[0], cc[0], "observed", normalization, "BP", resolution,
+            )
+            mo2 = hic2.getMatrixZoomData(
+                cr[0], cc[0], "observed", normalization, "BP", resolution,
+            )
             if ordering_check(cr[0], cc[0], chrom_order):
-                m1 = hic1.fetch(cr[0], cc[0], normalization=norm_arg).to_numpy()
-                m2 = hic2.fetch(cr[0], cc[0], normalization=norm_arg).to_numpy()
+                m1 = mo1.getRecordsAsMatrix(1, int(cr[1]), 1, int(cc[1]))
+                m2 = mo2.getRecordsAsMatrix(1, int(cr[1]), 1, int(cc[1]))
             else:
-                m1 = hic1.fetch(cc[0], cr[0], normalization=norm_arg).to_numpy()
-                m2 = hic2.fetch(cc[0], cr[0], normalization=norm_arg).to_numpy()
+                m1 = mo1.getRecordsAsMatrix(1, int(cc[1]), 1, int(cr[1]))
+                m2 = mo2.getRecordsAsMatrix(1, int(cc[1]), 1, int(cr[1]))
                 m1, m2 = m1.transpose(), m2.transpose()
 
             matrices.append(_diff(m1, norm1, m2, norm2, normalization))
@@ -316,8 +395,17 @@ def _plot_diff_allinone(path1, norm1, path2, norm2, output, resolution,
         hlines = sorted(set(r for _, (r, _) in zip(matrices, positions)) - {0})
         vlines = sorted(set(c for _, (_, c) in zip(matrices, positions)) - {0})
 
+    row_labels = col_labels = None
+    if labels:
+        row_centers, col_centers = grid_centers(matrices, per_row)
+        names = [strip_chr_prefix(c[0]) for c in chroms1]
+        row_labels = list(zip(row_centers, names))
+        col_labels = list(zip(col_centers, names))
+
     plot_matrix(final, output, cmap, -maxcolor, maxcolor,
-                hlines=hlines, vlines=vlines)
+                hlines=hlines, vlines=vlines,
+                row_labels=row_labels, col_labels=col_labels,
+                label_fontsize=label_fontsize)
 
 
 # ==========================================================================
@@ -335,6 +423,7 @@ Usage:
   dip-c hicplot -1 <file.hic>:<norm> -o <out.png> -r <bp> -s <val>
                 [-2 <file2.hic>:<norm>] [-c1 <chr:start-end>] [-c2 <chr:start-end>]
                 [-n <TYPE>] [-C <CMAP>] [--allinone] [-G]
+                [-L] [--label-fontsize <PT>]
 
 Mode is inferred from flags:
   -2 present        => difference map (file 1 minus file 2)
@@ -366,9 +455,32 @@ Colormap (-C):
     - Comma-separated colour stops:  -C 'white,red'  or  -C 'blue,white,red'
     - Hex colour stops:              -C '#0000ff,#ffffff,#ff0000'
 
+Chromosome labels (-L, --label-fontsize):
+  -L draws chromosome names alongside the matrix in every mode:
+    - Single region:    one label on the y-axis (chr1 of -c1) and one
+                        on the x-axis (chr2 of -c1, or -c2 if given).
+    - Per-chromosome:   one label on each axis of every per-chrom PNG.
+    - --allinone:       N labels down the left edge and N across the top,
+                        each centred on its chromosome's row/column.
+  The leading ``chr`` prefix is stripped (chr1 -> 1, chrX -> X).
+  --label-fontsize <PT> pins the font size in points; the default scales
+  with figure size (clamped to 6-20 pt). Has no effect without -L.
+
 Examples:
   # Absolute map, single symmetric region (SCALE normalization)
   dip-c hicplot -1 abc.hic -c1 chr1:1-10000000 \\
+                -o out.png -r 1000000 -s 1.5e-6 -n SCALE
+
+  # Same as above, with chromosome name shown alongside the map
+  dip-c hicplot -1 abc.hic -c1 chr1:1-10000000 -L \\
+                -o out.png -r 1000000 -s 1.5e-6 -n SCALE
+
+  # Same again, but pin the label font size to 14 pt
+  dip-c hicplot -1 abc.hic -c1 chr1:1-10000000 -L --label-fontsize 14 \\
+                -o out.png -r 1000000 -s 1.5e-6 -n SCALE
+
+  # All-in-one map with chrom labels around the entire grid
+  dip-c hicplot -1 abc.hic --allinone -L \\
                 -o out.png -r 1000000 -s 1.5e-6 -n SCALE
 
   # Absolute map, asymmetric region (chr1 vs chr2)
@@ -476,6 +588,23 @@ Examples:
         help="Turn off chromosome boundary gridlines in --allinone mode.",
     )
 
+    # -- Optional: chrom-name labels -------------------------------------
+    p.add_argument(
+        "-L", "--labels", action="store_true", default=False,
+        help="Draw chromosome names alongside the contact map(s). "
+             "Names are shown without any leading 'chr' prefix "
+             "(e.g. 'chr1' -> '1', 'chrX' -> 'X'). "
+             "Works in every mode (single region, per-chromosome, "
+             "--allinone, and their difference variants).",
+    )
+    p.add_argument(
+        "--label-fontsize", dest="label_fontsize", type=float, default=None,
+        metavar="PT",
+        help="Override the chromosome-label font size, in points. "
+             "Default: scale with figure size (range 6-20 pt). "
+             "Has no effect without -L.",
+    )
+
     # -- Optional: normalization -----------------------------------------
     p.add_argument(
         "-n", "--normalization", default="NONE",
@@ -484,7 +613,7 @@ Examples:
              "Common choices: NONE, KR, VC, VC_SQRT, SCALE -- but any "
              "normalization present in the .hic file is accepted. "
              "When not NONE, the :NORM values in -1/-2 are ignored and "
-             "the .hic file's built-in balancing is used instead.",
+             "hic-straw's built-in balancing is used instead.",
     )
 
     # -- Optional: colormap ----------------------------------------------
@@ -562,6 +691,18 @@ def hicplot(argv):
     # -- Resolve optional custom colormap ---------------------------------
     user_cmap = resolve_colormap(args.colormap) if args.colormap else None
 
+    show_labels = args.labels
+    label_fontsize = args.label_fontsize
+
+    if label_fontsize is not None:
+        if label_fontsize <= 0:
+            parser.error("--label-fontsize must be positive (got %g)"
+                         % label_fontsize)
+        if not show_labels:
+            sys.stderr.write(
+                "[W::hicplot] --label-fontsize is ignored without -L\n"
+            )
+
     # -- Dispatch ---------------------------------------------------------
     try:
         if is_diff:
@@ -575,29 +716,39 @@ def hicplot(argv):
             if is_region:
                 _plot_diff_map(path1, norm1, path2, norm2, output,
                                chroms, region, resolution, maxcolor,
-                               normalization, cmap=user_cmap)
+                               normalization, cmap=user_cmap,
+                               labels=show_labels,
+                               label_fontsize=label_fontsize)
             elif is_allinone:
                 _plot_diff_allinone(path1, norm1, path2, norm2, output,
                                     resolution, maxcolor, normalization,
-                                    gridlines=gridlines, cmap=user_cmap)
+                                    gridlines=gridlines, cmap=user_cmap,
+                                    labels=show_labels,
+                                    label_fontsize=label_fontsize)
             else:
                 _plot_diff_all(path1, norm1, path2, norm2, output,
                                resolution, maxcolor, normalization,
-                               cmap=user_cmap)
+                               cmap=user_cmap, labels=show_labels,
+                               label_fontsize=label_fontsize)
         else:
             if is_region:
                 _plot_map(path1, norm1, output, chroms, region,
-                          resolution, maxcolor, normalization, cmap=user_cmap)
+                          resolution, maxcolor, normalization,
+                          cmap=user_cmap, labels=show_labels,
+                          label_fontsize=label_fontsize)
             elif is_allinone:
                 _plot_allinone(path1, norm1, output, resolution, maxcolor,
                                normalization, gridlines=gridlines,
-                               cmap=user_cmap)
+                               cmap=user_cmap, labels=show_labels,
+                               label_fontsize=label_fontsize)
             else:
                 _plot_all(path1, norm1, output, resolution, maxcolor,
-                          normalization, cmap=user_cmap)
+                          normalization, cmap=user_cmap,
+                          labels=show_labels,
+                          label_fontsize=label_fontsize)
     except MemoryError:
         sys.stderr.write(
-            "[E::hicplot] Out of memory.  "
+            "[E::hicplot] hic-straw crashed (out of memory).  "
             "This usually means the requested normalization '%s' "
             "is not available in the .hic file at %d BP resolution.\n"
             % (normalization, resolution)

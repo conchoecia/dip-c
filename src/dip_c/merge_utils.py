@@ -77,23 +77,47 @@ def check_required_tools():
 def extract_header(pairs_gz_path):
     """Read header lines (starting with ``#``) from a .pairs.gz file.
 
-    Returns the header as a string (with trailing newline).
+    Streams gunzip's output and stops at the first non-``#`` line, so
+    only the header is decompressed (not the whole file).
+
+    Raises ``RuntimeError`` if gunzip fails (e.g. truncated/corrupt
+    file). Returns the header as a string (with trailing newline);
+    returns ``""`` and warns on stderr if no header lines are found.
     """
-    proc = subprocess.run(
+    proc = subprocess.Popen(
         ["gunzip", "-c", pairs_gz_path],
-        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        text=True,
     )
     lines = []
-    for line in proc.stdout.decode("utf-8", errors="replace").splitlines():
-        if line.startswith("#"):
-            lines.append(line)
-        else:
-            break
+    try:
+        for line in proc.stdout:
+            line = line.rstrip("\n")
+            if line.startswith("#"):
+                lines.append(line)
+            else:
+                break
+    finally:
+        proc.stdout.close()
+        stderr_text = proc.stderr.read()
+        proc.stderr.close()
+        proc.wait()
+
+    # We close the pipe early once the header ends, so gunzip will
+    # typically exit via SIGPIPE (-13 on POSIX). That's expected, not
+    # an error. Any other non-zero return is a real failure.
+    if proc.returncode not in (0, -13, 141):
+        raise RuntimeError(
+            "gunzip failed on %s (exit %d): %s"
+            % (pairs_gz_path, proc.returncode, stderr_text.strip())
+        )
+
     if not lines:
         sys.stderr.write(
             "[W::merge] No header lines found in %s\n" % pairs_gz_path
         )
-    return "\n".join(lines) + "\n" if lines else ""
+        return ""
+    return "\n".join(lines) + "\n"
 
 
 # ---------------------------------------------------------------------------
@@ -101,19 +125,41 @@ def extract_header(pairs_gz_path):
 # ---------------------------------------------------------------------------
 
 def decompress_strip_header(pairs_gz, output_path):
-    """``gunzip -c FILE | grep -v '^#' > output_path``."""
-    with open(output_path, "w") as out:
+    """``gunzip -c FILE | grep -v '^#' > output_path``.
+
+    Raises ``RuntimeError`` if gunzip fails (corrupt .gz, truncated
+    file, etc.) or grep encounters a real error. A grep exit code of
+    1 (no matching lines) is treated as success — it just means the
+    input had no data rows.
+    """
+    with open(output_path, "wb") as out:
         gunzip = subprocess.Popen(
             ["gunzip", "-c", pairs_gz],
-            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
         )
         grep = subprocess.Popen(
             ["grep", "-v", "^#"],
-            stdin=gunzip.stdout, stdout=out, stderr=subprocess.DEVNULL,
+            stdin=gunzip.stdout, stdout=out, stderr=subprocess.PIPE,
         )
+        # Close our handle so gunzip sees EOF (and SIGPIPE) properly
+        # if grep exits early.
         gunzip.stdout.close()
-        grep.wait()
-        gunzip.wait()
+        _, grep_err = grep.communicate()
+        _, gunzip_err = gunzip.communicate()
+
+    if gunzip.returncode != 0:
+        raise RuntimeError(
+            "gunzip failed on %s (exit %d): %s"
+            % (pairs_gz, gunzip.returncode,
+               (gunzip_err or b"").decode("utf-8", "replace").strip())
+        )
+    # grep: 0 = matches, 1 = no matches (empty body, OK), >=2 = error.
+    if grep.returncode not in (0, 1):
+        raise RuntimeError(
+            "grep failed on %s (exit %d): %s"
+            % (pairs_gz, grep.returncode,
+               (grep_err or b"").decode("utf-8", "replace").strip())
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -121,12 +167,27 @@ def decompress_strip_header(pairs_gz, output_path):
 # ---------------------------------------------------------------------------
 
 def count_lines(path):
-    """Fast line count via ``wc -l``."""
+    """Fast line count via ``wc -l``.
+
+    Raises ``RuntimeError`` if wc fails or produces unparseable output.
+    """
     result = subprocess.run(
         ["wc", "-l", path],
-        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
     )
-    return int(result.stdout.split()[0])
+    if result.returncode != 0:
+        raise RuntimeError(
+            "wc failed on %s (exit %d): %s"
+            % (path, result.returncode,
+               result.stderr.decode("utf-8", "replace").strip())
+        )
+    try:
+        return int(result.stdout.split()[0])
+    except (ValueError, IndexError) as e:
+        raise RuntimeError(
+            "wc produced unparseable output for %s: %r"
+            % (path, result.stdout)
+        ) from e
 
 
 # ---------------------------------------------------------------------------
